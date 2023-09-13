@@ -41,9 +41,9 @@ static int default_exit_safe_zone_timeout_ms(uint32_t timeout_ms);
 // FreeRTOS, as we may support mixed multicore and non SMP FreeRTOS in the future
 
 static flash_safety_helper_t default_flash_safety_helper = {
-        .core_init_deinit = default_core_init_deinit,
-        .enter_safe_zone_timeout_ms = default_enter_safe_zone_timeout_ms,
-        .exit_safe_zone_timeout_ms = default_exit_safe_zone_timeout_ms
+    .core_init_deinit = default_core_init_deinit,
+    .enter_safe_zone_timeout_ms = default_enter_safe_zone_timeout_ms,
+    .exit_safe_zone_timeout_ms = default_exit_safe_zone_timeout_ms
 };
 
 #if PICO_FLASH_SAFE_EXECUTE_USE_FREERTOS_SMP
@@ -139,28 +139,31 @@ static int default_enter_safe_zone_timeout_ms(__unused uint32_t timeout_ms) {
     int rc = PICO_OK;
     if (!use_irq_only()) {
 #if PICO_FLASH_SAFE_EXECUTE_USE_FREERTOS_SMP
-        // Note that whilst taskENTER_CRITICAL sounds promising (and on non SMP it disabled IRQs), on SMP
-        // it only prevents the other core from also entering a critical section.
-        // Therefore, we must do our own handshake which starts a task on the other core and have it disable interrupts
-        uint core_num = get_core_num();
-        // create at low priority
-        TaskHandle_t task_handle;
-        if (pdPASS != xTaskCreate(flash_lockout_task, "flash lockout", configMINIMAL_STACK_SIZE, (void *)core_num, 0, &task_handle)) {
-            return PICO_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_WAITING;
-        __sev();
-        // bind to other core
-        vTaskCoreAffinitySet(task_handle, 1u << (core_num ^ 1));
-        // and make it super high priority
-        vTaskPrioritySet(task_handle, configMAX_PRIORITIES -1);
-        absolute_time_t until = make_timeout_time_ms(timeout_ms);
-        while (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_READY && !time_reached(until)) {
-            __wfe(); // we don't bother to try to let lower priority tasks run
-        }
-        if (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_READY) {
-            lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_DONE;
-            rc = PICO_ERROR_TIMEOUT;
+        // If the scheduler has not yet started we don't need to block the other core
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            // Note that whilst taskENTER_CRITICAL sounds promising (and on non SMP it disabled IRQs), on SMP
+            // it only prevents the other core from also entering a critical section.
+            // Therefore, we must do our own handshake which starts a task on the other core and have it disable interrupts
+            uint core_num = get_core_num();
+            // create at low priority
+            TaskHandle_t task_handle;
+            if (pdPASS != xTaskCreate(flash_lockout_task, "flash lockout", configMINIMAL_STACK_SIZE, (void *)core_num, 0, &task_handle)) {
+                return PICO_ERROR_INSUFFICIENT_RESOURCES;
+            }
+            lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_WAITING;
+            __sev();
+            // bind to other core
+            vTaskCoreAffinitySet(task_handle, 1u << (core_num ^ 1));
+            // and make it super high priority
+            vTaskPrioritySet(task_handle, configMAX_PRIORITIES -1);
+            absolute_time_t until = make_timeout_time_ms(timeout_ms);
+            while (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_READY && !time_reached(until)) {
+                __wfe(); // we don't bother to try to let lower priority tasks run
+            }
+            if (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_READY) {
+                lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_DONE;
+                rc = PICO_ERROR_TIMEOUT;
+            }
         }
         // todo we may get preempted here, but I think that is OK unless what is pre-empts requires
         //      the other core to be running.
@@ -170,7 +173,7 @@ static int default_enter_safe_zone_timeout_ms(__unused uint32_t timeout_ms) {
 #if LIB_FREERTOS_KERNEL
 #if PICO_FLASH_ASSERT_ON_UNSAFE
         assert(false); // we expect the other core to have been initialized via flash_safe_execute_core_init()
-                       // unless PICO_FLASH_ASSUME_COREX_SAFE is set
+                        // unless PICO_FLASH_ASSUME_COREX_SAFE is set
 #endif
         rc = PICO_ERROR_NOT_PERMITTED;
 #else // !LIB_FREERTOS_KERNEL
@@ -181,7 +184,7 @@ static int default_enter_safe_zone_timeout_ms(__unused uint32_t timeout_ms) {
         } else {
 #if PICO_FLASH_ASSERT_ON_UNSAFE
             assert(false); // we expect the other core to have been initialized via flash_safe_execute_core_init()
-                           // unless PICO_FLASH_ASSUME_COREX_SAFE is set
+                            // unless PICO_FLASH_ASSUME_COREX_SAFE is set
 #endif
             rc = PICO_ERROR_NOT_PERMITTED;
         }
@@ -203,16 +206,20 @@ static int default_exit_safe_zone_timeout_ms(__unused uint32_t timeout_ms) {
     restore_interrupts(irq_state[get_core_num()]);
     if (!use_irq_only()) {
 #if PICO_FLASH_SAFE_EXECUTE_USE_FREERTOS_SMP
-        uint core_num = get_core_num();
-        lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_DONE;
-        __sev();
-        absolute_time_t until = make_timeout_time_ms(timeout_ms);
-        while (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_DONE && !time_reached(until)) {
-            __wfe(); // we don't bother to try to let lower priority tasks run
-        }
-        if (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_DONE) {
-            return PICO_ERROR_TIMEOUT;
-        }
+            uint core_num = get_core_num();
+            lockout_state[core_num] = FREERTOS_LOCKOUT_LOCKER_DONE;
+            __sev();
+            // We should only wait for the lockee to finish if the scheduler is actually running
+            // If the scheduler was not running no such task will have been created
+            if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+                absolute_time_t until = make_timeout_time_ms(timeout_ms);
+                while (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_DONE && !time_reached(until)) {
+                    __wfe(); // we don't bother to try to let lower priority tasks run
+                }
+                if (lockout_state[core_num] != FREERTOS_LOCKOUT_LOCKEE_DONE) {
+                    return PICO_ERROR_TIMEOUT;
+                }
+            }
 #elif PICO_FLASH_SAFE_EXECUTE_PICO_SUPPORT_MULTICORE_LOCKOUT
         return multicore_lockout_end_timeout_us(timeout_ms * 1000ull) ? PICO_OK : PICO_ERROR_TIMEOUT;
 #endif
